@@ -6,6 +6,9 @@ Writes one video track into a Matroska (`.mkv`) file. Plain C with no dependenci
 - **H.264:** give it Annex-B, with three- or four-byte start codes. SPS and PPS go into the
   track's avcC, and start codes become lengths in place.
 - **MJPEG:** give it complete JPEGs.
+- **Raw video:** give it whole uncompressed pictures and name their pixel format as a FourCC,
+  such as `YUY2` or `NV12`. It is stored as `V_UNCOMPRESSED`, the way ffmpeg writes and reads
+  it.
 
 A file cut short by a crash or a full disk plays up to the cut. Past that point nothing is
 lost: the Segment and Clusters stay of unknown size, and only the Duration and SeekHead are
@@ -18,7 +21,7 @@ two file callbacks, and it never allocates or calls the OS.
 
 ```c
 static const struct mkv_io io = {&file, my_write, my_seek};
-const struct mkv_track track = {MKV_H264, 1280, 720, 30, "MyProgram"};
+const struct mkv_track track = {.codec = MKV_H264, .width = 1280, .height = 720, .fps = 30, .app = "MyProgram"};
 struct mkv m;
 
 mkv_open(&m, &io, &track, memory, MKV_MEMORY);

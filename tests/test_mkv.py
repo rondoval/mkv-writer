@@ -14,7 +14,7 @@ WIDTH, HEIGHT, FPS, SECONDS = 320, 180, 30, 6
 
 EBML, SEGMENT, SEEK_HEAD, SEEK, SEEK_ID, SEEK_POSITION = 0x1A45DFA3, 0x18538067, 0x114D9B74, 0x4DBB, 0x53AB, 0x53AC
 INFO, DURATION, TRACKS, TRACK_ENTRY, CODEC_ID, CODEC_PRIVATE = 0x1549A966, 0x4489, 0x1654AE6B, 0xAE, 0x86, 0x63A2
-DEFAULT_DURATION, VIDEO, PIXEL_WIDTH, PIXEL_HEIGHT = 0x23E383, 0xE0, 0xB0, 0xBA
+DEFAULT_DURATION, VIDEO, PIXEL_WIDTH, PIXEL_HEIGHT, COLOUR_SPACE = 0x23E383, 0xE0, 0xB0, 0xBA, 0x2EB524
 CLUSTER, TIMESTAMP, SIMPLE_BLOCK, CUES, CUE_POINT, CUE_TIME = 0x1F43B675, 0xE7, 0xA3, 0x1C53BB6B, 0xBB, 0xB3
 CUE_TRACK_POSITIONS, CUE_TRACK, CUE_CLUSTER_POSITION, VOID = 0xB7, 0xF7, 0xF1, 0xEC
 TOP_LEVEL = {SEEK_HEAD, INFO, TRACKS, CLUSTER, CUES, VOID}
@@ -579,6 +579,58 @@ def test_writing_app(host, tmp_path, stream):
     _, pictures = stream
     data = mux(host, tmp_path, pictures[:2]).read_bytes()
     assert b"mkv-writer" in data[:512] and b"mkv_host" in data[:512]
+
+
+@pytest.fixture(scope="module", params=[("yuyv422", "YUY2", 2), ("nv12", "NV12", 1.5)], ids=["YUY2", "NV12"])
+def raws(request, tmp_path_factory):
+    """Two seconds of uncompressed video: (raw file, ffmpeg's pixel format, the FourCC, pictures)."""
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("no ffmpeg")
+    pix_fmt, fourcc, bytes_per_pixel = request.param
+    raw = tmp_path_factory.mktemp("raw") / f"clip.{pix_fmt}"
+    r = run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"testsrc2=s={WIDTH}x{HEIGHT}:r={FPS}:d=2", "-pix_fmt", pix_fmt,
+             "-f", "rawvideo", raw])
+    assert r.returncode == 0, r.stderr.decode()
+    data, size = raw.read_bytes(), int(WIDTH * HEIGHT * bytes_per_pixel)
+    frames = [data[at:at + size] for at in range(0, len(data), size)]
+    assert len(frames) == FPS * 2 and len(frames[-1]) == size
+    return raw, pix_fmt, fourcc, [(i * 1000 // FPS, False, frame) for i, frame in enumerate(frames)]
+
+
+def test_raw_decodes_the_same(host, tmp_path, raws):
+    """Each picture decodes from the file as from the raw input, and ffmpeg has nothing to complain of."""
+    raw, pix_fmt, fourcc, pictures = raws
+    out = mux(host, tmp_path, pictures, f"raw={fourcc}")
+    want, _ = frame_md5("-f", "rawvideo", "-pix_fmt", pix_fmt, "-s", f"{WIDTH}x{HEIGHT}", "-framerate", str(FPS), "-i", raw)
+    got, errors = frame_md5("-i", out)
+    assert errors == "", errors
+    assert got == want and len(got) == len(pictures)
+
+
+def test_raw_track(host, tmp_path, raws):
+    """V_UNCOMPRESSED with the FourCC as ColourSpace, which ffprobe turns back into the pixel format; the
+    pictures as they came, every one a key frame, a cluster and a cue a second."""
+    _, pix_fmt, fourcc, pictures = raws
+    out = mux(host, tmp_path, pictures, f"raw={fourcc}")
+    r = run(["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries",
+             "stream=codec_name,codec_tag_string,pix_fmt,width,height", "-of", "default=nw=1", out])
+    fields = dict(line.split("=") for line in r.stdout.decode().split())
+    assert (fields["codec_name"], fields["codec_tag_string"], fields["pix_fmt"]) == ("rawvideo", fourcc, pix_fmt)
+    assert (int(fields["width"]), int(fields["height"])) == (WIDTH, HEIGHT)
+    f = File(out.read_bytes())
+    tracks = f.top_one(TRACKS)
+    entry = one(children(f.data, tracks[1], tracks[1] + tracks[2]), TRACK_ENTRY)
+    parts = children(f.data, entry[1], entry[1] + entry[2])
+    codec = one(parts, CODEC_ID)
+    assert f.data[codec[1]:codec[1] + codec[2]] == b"V_UNCOMPRESSED"
+    assert not [p for p in parts if p[0] == CODEC_PRIVATE]
+    video = one(parts, VIDEO)
+    colour = one(children(f.data, video[1], video[1] + video[2]), COLOUR_SPACE)
+    assert f.data[colour[1]:colour[1] + colour[2]] == fourcc.encode()
+    assert [b["body"] for b in f.blocks()] == [data for _, _, data in pictures]
+    assert all(b["key"] for b in f.blocks())
+    assert [c["pos"] for c in f.clusters] == [pos for _, pos in f.cues()]
+    assert len(f.clusters) == 2
 
 
 @pytest.mark.parametrize("count", [6, 7, 13, 14, 15, 862, 863, 864])

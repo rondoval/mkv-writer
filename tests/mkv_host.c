@@ -3,7 +3,7 @@
  * mkv_host.c - mkv.c on the host, for test_mkv.py: a recording read from a
  * script, written to a file as the Amiga's would be.
  *
- *   mkv_host script out.mkv WIDTH HEIGHT FPS [full=BYTES] [repeat=N] [unfinished] [mjpeg]
+ *   mkv_host script out.mkv WIDTH HEIGHT FPS [full=BYTES] [repeat=N] [unfinished] [mjpeg] [raw=FOURCC]
  *
  * The script is the calls the recorder makes, in 32-bit little-endian words:
  * for each picture its time in ms, whether it is a key frame and how many
@@ -14,6 +14,7 @@
  * unfinished  the script's last picture is never ended, as when a run stops
  *        between a picture's packets
  * mjpeg  the pictures are JPEGs, not H.264
+ * raw=   the pictures are uncompressed, in this pixel format (YUY2, NV12)
  *
  * The seek refuses what PFS3's refuses: a target at or above 2 GiB.
  *
@@ -109,7 +110,8 @@ int main(int argc, char **argv)
 	unsigned long long full = 0;
 	unsigned long repeat = 1;
 	int unfinished = 0;
-	struct mkv_track track = {MKV_H264, (uint32_t)atoi(argv[3]), (uint32_t)atoi(argv[4]), (uint32_t)atoi(argv[5]), "mkv_host"};
+	struct mkv_track track = {.codec = MKV_H264, .width = (uint32_t)atoi(argv[3]), .height = (uint32_t)atoi(argv[4]),
+	                          .fps = (uint32_t)atoi(argv[5]), .app = "mkv_host"};
 	for (int i = 6; i < argc; i++)
 	{
 		if (strncmp(argv[i], "full=", 5) == 0)
@@ -120,6 +122,12 @@ int main(int argc, char **argv)
 			unfinished = 1;
 		else if (strcmp(argv[i], "mjpeg") == 0)
 			track.codec = MKV_MJPEG;
+		else if (strncmp(argv[i], "raw=", 4) == 0 && strlen(argv[i]) == 8)
+		{
+			const unsigned char *f = (const unsigned char *)argv[i] + 4;
+			track.codec = MKV_RAW;
+			track.fourcc = (uint32_t)f[0] << 24 | (uint32_t)f[1] << 16 | (uint32_t)f[2] << 8 | f[3];
+		}
 		else
 			return 99;
 	}
