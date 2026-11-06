@@ -38,11 +38,12 @@
  *
  * The rest is specific to a recorder:
  *
- * H.264 arrives as Annex-B, with SPS and PPS in or before the first picture.
- * The first SPS and PPS go into the track's avcC (CodecPrivate), so the file
- * header is written only once they have been seen; every SPS and PPS is
- * removed from the stream. Start codes are rewritten to 4-byte NAL lengths in
- * place, and a picture may arrive in any number of pieces. MJPEG and raw
+ * H.264 and H.265 arrive as Annex-B, with their parameter sets (H.265: VPS,
+ * SPS, PPS; H.264: SPS, PPS) in or before the first picture. The first of
+ * each go into the track's avcC or hvcC (CodecPrivate), so the file header is
+ * written only once they have been seen; every parameter set is removed from
+ * the stream. Start codes are rewritten to 4-byte NAL lengths in place, and a
+ * picture may arrive in any number of pieces. MJPEG and raw
  * pictures are stored as they arrive; each is a key frame, so Clusters and
  * cue points are opened by time instead. A raw track names its pixel format
  * as a FourCC (ColourSpace), as ffmpeg writes and reads it.
@@ -148,18 +149,49 @@
 #define BLOCK_KEYFRAME 0x80u
 
 /* Space reserved before writing */
-#define FILE_HEADER_MOST 512u     /* EBML header, Segment start, Info, Tracks; without app name, SPS, PPS */
+#define FILE_HEADER_MOST 512u     /* EBML header, Segment start, Info, Tracks; without app name and parameter sets */
 #define ELEMENT_HEADERS_MOST 64u  /* a picture's Cluster and SimpleBlock headers, or the Cues' header */
 
 #define CUE_FRACTION 8u /* the cue array gets 1/CUE_FRACTION of the memory */
 
-/* H.264 */
-#define NAL_TYPE_MASK 0x1Fu
-#define NAL_SPS 7u
-#define NAL_PPS 8u
+/* H.264: a NAL unit's 1-byte header holds its type in bits 4..0 */
+#define H264_NAL_HEADER_BYTES 1u
+#define H264_NAL_TYPE_MASK 0x1Fu
+#define H264_NAL_SPS 7u
+#define H264_NAL_PPS 8u
 #define PROFILE_BASELINE 66u
 #define PROFILE_MAIN 77u
 #define PROFILE_EXTENDED 88u
+
+/* H.265: a NAL unit's 2-byte header holds its type in bits 6..1 of the first byte */
+#define H265_NAL_HEADER_BYTES 2u
+#define H265_NAL_TYPE_SHIFT 1u
+#define H265_NAL_TYPE_MASK 0x3Fu
+#define H265_NAL_VPS 32u
+#define H265_NAL_SPS 33u
+#define H265_NAL_PPS 34u
+/* H.265 SPS syntax, as far as the hvcC needs it (H.265 7.3.2.2, 7.3.3) */
+#define H265_VPS_ID_BITS 4u
+#define H265_MAX_SUB_LAYERS_BITS 3u
+#define H265_SUB_LAYERS_MOST 7u        /* sps_max_sub_layers_minus1 is 0..6 */
+#define H265_GENERAL_PROFILE_BYTES 12u /* profile_tier_level up to general_level_idc, byte-aligned in the SPS */
+#define H265_SUB_LAYER_SLOTS 8u        /* the PTL's sub-layer flags are padded to this many */
+#define H265_RESERVED_SLOT_BITS 2u     /* reserved_zero_2bits of each slot past the sub-layers */
+#define H265_SUB_LAYER_PROFILE_BITS 88u
+#define H265_SUB_LAYER_LEVEL_BITS 8u
+#define H265_CHROMA_444 3u
+#define H265_CONFORMANCE_OFFSETS 4u    /* conf_win_left/right/top/bottom_offset */
+#define H265_UE_ZEROS_MOST 31u         /* the longest ue(v) prefix of a 32-bit value */
+#define EMULATION_PREVENTION 0x03u     /* follows two zero bytes in a NAL unit; not part of its RBSP */
+
+/* hvcC (ISO/IEC 14496-15, HEVCDecoderConfigurationRecord) */
+#define HVCC_VERSION 1u
+#define HVCC_ARRAYS 3u              /* VPS, SPS, PPS */
+#define HVCC_ARRAY_COMPLETE 0x80u   /* array_completeness: no NAL unit of the type stays in the stream */
+#define HVCC_NAL_LENGTH_MINUS_ONE 3u /* lengthSizeMinusOne: 4-byte NAL lengths */
+#define HVCC_TEMPORAL_LAYERS_SHIFT 3u
+#define HVCC_TEMPORAL_NESTED_SHIFT 2u
+#define HVCC_BIT_DEPTH_EXTRA_MOST 7u /* bitDepth*Minus8 has 3 bits */
 
 /* ---- Bytes at the tail ---------------------------------------------------------- */
 
@@ -457,6 +489,228 @@ static int header_sent(const struct mkv *m)
 	return m->written != 0;
 }
 
+/* ---- NAL-unit codecs ------------------------------------------------------------ */
+
+/**
+ * annexb() - Tell whether the track's pictures are NAL units in Annex-B, rewritten to lengths.
+ * @m: the muxer
+ *
+ * Return: nonzero for H.264 and H.265.
+ */
+static int annexb(const struct mkv *m)
+{
+	return m->track.codec == MKV_H264 || m->track.codec == MKV_H265;
+}
+
+/**
+ * nal_header_bytes() - Tell the size of a NAL unit's header in the track's codec.
+ * @m: the muxer, of an annexb() track
+ *
+ * Return: the bytes.
+ */
+static uint32_t nal_header_bytes(const struct mkv *m)
+{
+	return m->track.codec == MKV_H265 ? H265_NAL_HEADER_BYTES : H264_NAL_HEADER_BYTES;
+}
+
+/**
+ * parameter_set() - Find where a NAL unit is kept if it is a parameter set.
+ * @m:   the muxer, of an annexb() track
+ * @nal: the NAL unit, its header complete
+ *
+ * Return: &m->vps, &m->sps or &m->pps; NULL for a NAL unit of any other type.
+ */
+static struct mkv_parameter_set *parameter_set(struct mkv *m, const uint8_t *nal)
+{
+	if (m->track.codec == MKV_H265)
+	{
+		switch ((nal[0] >> H265_NAL_TYPE_SHIFT) & H265_NAL_TYPE_MASK)
+		{
+		case H265_NAL_VPS:
+			return &m->vps;
+		case H265_NAL_SPS:
+			return &m->sps;
+		case H265_NAL_PPS:
+			return &m->pps;
+		default:
+			return NULL;
+		}
+	}
+	switch (nal[0] & H264_NAL_TYPE_MASK)
+	{
+	case H264_NAL_SPS:
+		return &m->sps;
+	case H264_NAL_PPS:
+		return &m->pps;
+	default:
+		return NULL;
+	}
+}
+
+/**
+ * parameter_sets_known() - Tell whether every parameter set the CodecPrivate holds has been kept.
+ * @m: the muxer, of an annexb() track
+ *
+ * Return: nonzero once they all have.
+ */
+static int parameter_sets_known(const struct mkv *m)
+{
+	return m->sps.size != 0 && m->pps.size != 0 && (m->track.codec != MKV_H265 || m->vps.size != 0);
+}
+
+/* ---- H.265 SPS ------------------------------------------------------------------ */
+
+/* A bit reader over a NAL unit's payload that skips its emulation prevention bytes */
+struct rbsp
+{
+	const uint8_t *at, *end;
+	uint32_t zeros;     /* zero bytes just read, in a row */
+	uint32_t byte;      /* the byte being read */
+	uint32_t bits_left; /* its bits not yet read */
+	int overrun;        /* a read went past the end */
+};
+
+/* What the hvcC takes from an H.265 SPS */
+struct hevc_profile
+{
+	uint8_t general[H265_GENERAL_PROFILE_BYTES]; /* profile space, tier, profile, compatibility, constraints, level */
+	uint32_t sub_layers;                         /* sps_max_sub_layers_minus1 + 1 */
+	uint32_t temporal_id_nested;                 /* sps_temporal_id_nesting_flag */
+	uint32_t chroma_format;                      /* chroma_format_idc */
+	uint32_t bit_depth_luma_minus8;
+	uint32_t bit_depth_chroma_minus8;
+};
+
+/**
+ * rbsp_bit() - Read one bit.
+ * @r: the reader
+ *
+ * Return: the bit; 0 past the end, which sets @overrun.
+ */
+static uint32_t rbsp_bit(struct rbsp *r)
+{
+	if (r->bits_left == 0)
+	{
+		if (r->zeros >= 2u && r->at < r->end && *r->at == EMULATION_PREVENTION)
+		{
+			r->at++;
+			r->zeros = 0;
+		}
+		if (r->at == r->end)
+		{
+			r->overrun = 1;
+			return 0;
+		}
+		r->byte = *r->at++;
+		r->zeros = r->byte == 0 ? r->zeros + 1u : 0;
+		r->bits_left = 8;
+	}
+	r->bits_left--;
+	return (r->byte >> r->bits_left) & 1u;
+}
+
+/**
+ * rbsp_bits() - Read an unsigned number of fixed width, u(n).
+ * @r:     the reader
+ * @count: its width, 0 to 32 bits
+ *
+ * Return: the number.
+ */
+static uint32_t rbsp_bits(struct rbsp *r, uint32_t count)
+{
+	uint32_t value = 0;
+	while (count-- != 0)
+		value = value << 1 | rbsp_bit(r);
+	return value;
+}
+
+/**
+ * rbsp_skip() - Pass over bits of no interest.
+ * @r:     the reader
+ * @count: how many
+ */
+static void rbsp_skip(struct rbsp *r, uint32_t count)
+{
+	while (count-- != 0)
+		rbsp_bit(r);
+}
+
+/**
+ * rbsp_ue() - Read an Exp-Golomb number, ue(v).
+ * @r: the reader
+ *
+ * Return: the number; 0 for one wider than 32 bits, which sets @overrun.
+ */
+static uint32_t rbsp_ue(struct rbsp *r)
+{
+	uint32_t zeros = 0;
+	while (rbsp_bit(r) == 0 && !r->overrun)
+	{
+		if (++zeros > H265_UE_ZEROS_MOST)
+		{
+			r->overrun = 1;
+			return 0;
+		}
+	}
+	return (1u << zeros) - 1u + rbsp_bits(r, zeros);
+}
+
+/**
+ * hevc_profile_read() - Read what the hvcC needs from an H.265 SPS.
+ * @sps:     the SPS NAL unit
+ * @profile: out: what it says
+ *
+ * Reads up to bit_depth_chroma_minus8, past the sub-layers' profiles and the
+ * conformance window.
+ *
+ * Return: nonzero if the SPS holds all of it, each value in what the hvcC can hold.
+ */
+static int hevc_profile_read(const struct mkv_parameter_set *sps, struct hevc_profile *profile)
+{
+	struct rbsp r = {.at = sps->data + H265_NAL_HEADER_BYTES, .end = sps->data + sps->size};
+	rbsp_skip(&r, H265_VPS_ID_BITS); /* sps_video_parameter_set_id */
+
+	uint32_t sub_layers_minus1 = rbsp_bits(&r, H265_MAX_SUB_LAYERS_BITS);
+	profile->temporal_id_nested = rbsp_bit(&r);
+	for (uint32_t i = 0; i < sizeof(profile->general); i++)
+		profile->general[i] = (uint8_t)rbsp_bits(&r, 8);
+	if (sub_layers_minus1 >= H265_SUB_LAYERS_MOST)
+		return 0;
+
+	uint8_t profile_present[H265_SUB_LAYER_SLOTS] = {0}, level_present[H265_SUB_LAYER_SLOTS] = {0};
+	for (uint32_t i = 0; i < sub_layers_minus1; i++)
+	{
+		profile_present[i] = (uint8_t)rbsp_bit(&r);
+		level_present[i] = (uint8_t)rbsp_bit(&r);
+	}
+	if (sub_layers_minus1 != 0)
+		rbsp_skip(&r, H265_RESERVED_SLOT_BITS * (H265_SUB_LAYER_SLOTS - sub_layers_minus1));
+	for (uint32_t i = 0; i < sub_layers_minus1; i++)
+	{
+		if (profile_present[i])
+			rbsp_skip(&r, H265_SUB_LAYER_PROFILE_BITS);
+		if (level_present[i])
+			rbsp_skip(&r, H265_SUB_LAYER_LEVEL_BITS);
+	}
+
+	rbsp_ue(&r); /* sps_seq_parameter_set_id */
+	profile->chroma_format = rbsp_ue(&r);
+	if (profile->chroma_format == H265_CHROMA_444)
+		rbsp_skip(&r, 1); /* separate_colour_plane_flag */
+	rbsp_ue(&r);          /* pic_width_in_luma_samples */
+	rbsp_ue(&r);          /* pic_height_in_luma_samples */
+	if (rbsp_bit(&r))     /* conformance_window_flag */
+	{
+		for (uint32_t i = 0; i < H265_CONFORMANCE_OFFSETS; i++)
+			rbsp_ue(&r);
+	}
+	profile->bit_depth_luma_minus8 = rbsp_ue(&r);
+	profile->bit_depth_chroma_minus8 = rbsp_ue(&r);
+	profile->sub_layers = sub_layers_minus1 + 1u;
+	return !r.overrun && profile->chroma_format <= H265_CHROMA_444 && profile->bit_depth_luma_minus8 <= HVCC_BIT_DEPTH_EXTRA_MOST &&
+	       profile->bit_depth_chroma_minus8 <= HVCC_BIT_DEPTH_EXTRA_MOST;
+}
+
 /* ---- File header ---------------------------------------------------------------- */
 
 /**
@@ -489,13 +743,56 @@ static void avcc_write(struct mkv *m)
 }
 
 /**
+ * hvcc_array() - Append one array of the hvcC: a parameter set's type and the one kept.
+ * @m:    the muxer
+ * @type: its NAL unit type
+ * @set:  the kept copy
+ */
+static void hvcc_array(struct mkv *m, uint32_t type, const struct mkv_parameter_set *set)
+{
+	put_u8(m, (uint8_t)(HVCC_ARRAY_COMPLETE | type)); /* array_completeness, reserved 0, NAL_unit_type */
+	put_be(m, 1, 2);                                  /* numNalus */
+	put_be(m, set->size, 2);
+	put_bytes(m, set->data, set->size);
+}
+
+/**
+ * hvcc_write() - Append the CodecPrivate holding the hvcC: the only copy of VPS, SPS and PPS, which the stream loses.
+ * @m:       the muxer
+ * @profile: what the SPS says (hevc_profile_read())
+ *
+ * min_spatial_segmentation_idc, parallelismType, avgFrameRate and
+ * constantFrameRate are written as 0, which stands for not stated.
+ */
+static void hvcc_write(struct mkv *m, const struct hevc_profile *profile)
+{
+	uint32_t hvcc = element_open(m, ID_CODEC_PRIVATE);
+	put_u8(m, HVCC_VERSION); /* configurationVersion */
+	put_bytes(m, profile->general, sizeof(profile->general));
+	put_be(m, 0xF000u, 2);                                   /* reserved bits set, min_spatial_segmentation_idc */
+	put_u8(m, 0xFCu);                                        /* reserved bits set, parallelismType */
+	put_u8(m, (uint8_t)(0xFCu | profile->chroma_format));    /* reserved bits set, chromaFormat */
+	put_u8(m, (uint8_t)(0xF8u | profile->bit_depth_luma_minus8));
+	put_u8(m, (uint8_t)(0xF8u | profile->bit_depth_chroma_minus8));
+	put_be(m, 0, 2);                                         /* avgFrameRate */
+	put_u8(m, (uint8_t)(profile->sub_layers << HVCC_TEMPORAL_LAYERS_SHIFT | profile->temporal_id_nested << HVCC_TEMPORAL_NESTED_SHIFT |
+	                    HVCC_NAL_LENGTH_MINUS_ONE)); /* constantFrameRate 0, numTemporalLayers, temporalIdNested, lengthSizeMinusOne */
+	put_u8(m, HVCC_ARRAYS);                                  /* numOfArrays */
+	hvcc_array(m, H265_NAL_VPS, &m->vps);
+	hvcc_array(m, H265_NAL_SPS, &m->sps);
+	hvcc_array(m, H265_NAL_PPS, &m->pps);
+	element_close(m, hvcc);
+}
+
+/**
  * header_build() - Append the EBML header, the Segment's start, Info and Tracks.
- * @m:     the muxer; for H.264, SPS and PPS known
- * @start: the tail's offset, which becomes file offset 0
+ * @m:       the muxer; for H.264 and H.265, their parameter sets known
+ * @start:   the tail's offset, which becomes file offset 0
+ * @profile: for H.265, what its SPS says; not read for another codec
  *
  * Records the file offsets of what mkv_close() overwrites or points at.
  */
-static void header_build(struct mkv *m, uint32_t start)
+static void header_build(struct mkv *m, uint32_t start, const struct hevc_profile *profile)
 {
 	uint32_t ebml = element_open(m, ID_EBML);
 	ebml_uint(m, ID_EBML_VERSION, 1);
@@ -528,13 +825,23 @@ static void header_build(struct mkv *m, uint32_t start)
 	ebml_uint(m, ID_TRACK_TYPE, 1); /* video */
 	ebml_uint(m, ID_FLAG_LACING, 0);
 	ebml_uint(m, ID_DEFAULT_DURATION, 1000000000u / m->track.fps); /* ns */
-	if (m->track.codec == MKV_H264)
+	switch (m->track.codec)
 	{
+	case MKV_H264:
 		ebml_string(m, ID_CODEC_ID, "V_MPEG4/ISO/AVC");
 		avcc_write(m);
+		break;
+	case MKV_H265:
+		ebml_string(m, ID_CODEC_ID, "V_MPEGH/ISO/HEVC");
+		hvcc_write(m, profile);
+		break;
+	case MKV_MJPEG:
+		ebml_string(m, ID_CODEC_ID, "V_MJPEG");
+		break;
+	default:
+		ebml_string(m, ID_CODEC_ID, "V_UNCOMPRESSED");
+		break;
 	}
-	else
-		ebml_string(m, ID_CODEC_ID, m->track.codec == MKV_MJPEG ? "V_MJPEG" : "V_UNCOMPRESSED");
 	uint32_t video = element_open(m, ID_VIDEO);
 	ebml_uint(m, ID_PIXEL_WIDTH, m->track.width);
 	ebml_uint(m, ID_PIXEL_HEIGHT, m->track.height);
@@ -555,19 +862,21 @@ static void header_build(struct mkv *m, uint32_t start)
  * The header is built in the free space after the picture and written
  * directly, so it reaches the file first; the buffer holds it only meanwhile.
  *
- * Return: MKV_OK, MKV_ERR_STREAM if H.264 brought no SPS or PPS, or reserve()'s or the write's error.
+ * Return: MKV_OK; MKV_ERR_STREAM if H.264 or H.265 brought no parameter sets, or an H.265 SPS that
+ * the hvcC cannot describe; or reserve()'s or the write's error.
  */
 static int header_send(struct mkv *m)
 {
-	if (m->track.codec == MKV_H264 && (m->sps.size == 0 || m->pps.size == 0))
+	struct hevc_profile profile = {0};
+	if (annexb(m) && (!parameter_sets_known(m) || (m->track.codec == MKV_H265 && !hevc_profile_read(&m->sps, &profile))))
 	{
 		m->error = MKV_ERR_STREAM;
 		return m->error;
 	}
-	if (reserve(m, FILE_HEADER_MOST + (uint32_t)strlen(m->track.app) + m->sps.size + m->pps.size) != MKV_OK)
+	if (reserve(m, FILE_HEADER_MOST + (uint32_t)strlen(m->track.app) + m->vps.size + m->sps.size + m->pps.size) != MKV_OK)
 		return m->error;
 	uint32_t start = m->tail;
-	header_build(m, start);
+	header_build(m, start, &profile);
 	if (m->io->write(m->io->user, m->buffer + start, m->tail - start))
 		m->written += m->tail - start;
 	else
@@ -623,16 +932,15 @@ static const uint8_t *nal_end(const uint8_t *p, const uint8_t *end)
 }
 
 /**
- * keep_parameter_set() - Copy the first SPS and the first PPS for the avcC; later ones are dropped.
- * @m:    the muxer
- * @nal:  the SPS or PPS NAL unit
+ * keep_parameter_set() - Copy the first parameter set of its type for the avcC or hvcC; later ones are dropped.
+ * @set:  where its type is kept (parameter_set())
+ * @nal:  the NAL unit
  * @size: its size
  *
  * Return: MKV_OK, or MKV_ERR_STREAM if it is shorter than 4 bytes or does not fit.
  */
-static int keep_parameter_set(struct mkv *m, const uint8_t *nal, uint32_t size)
+static int keep_parameter_set(struct mkv_parameter_set *set, const uint8_t *nal, uint32_t size)
 {
-	struct mkv_parameter_set *set = (nal[0] & NAL_TYPE_MASK) == NAL_SPS ? &m->sps : &m->pps;
 	if (set->size != 0)
 		return MKV_OK;
 	if (size < 4u || size > sizeof(set->data))
@@ -691,7 +999,7 @@ static int picture_move_up(struct mkv *m, uint32_t by)
  * Each NAL unit is copied down to the output behind its length. A length
  * fills a 4-byte start code exactly but is a byte longer than a 3-byte one,
  * so the picture first moves up by one byte per 3-byte start code: then the
- * output never overtakes the input. SPS and PPS are taken out
+ * output never overtakes the input. Parameter sets are taken out
  * (keep_parameter_set()), and zero bytes after the last NAL unit dropped.
  *
  * Return: MKV_OK, MKV_ERR_STREAM for a malformed stream, or reserve()'s error.
@@ -714,12 +1022,12 @@ static int annexb_to_lengths(struct mkv *m, uint32_t *size)
 		const uint8_t *nal = in + start_code_bytes(in, end);
 		const uint8_t *next = nal_end(nal, end);
 		uint32_t nal_size = (uint32_t)(next - nal);
-		if (nal_size == 0)
+		if (nal_size < nal_header_bytes(m))
 			return MKV_ERR_STREAM;
-		uint32_t type = nal[0] & NAL_TYPE_MASK;
-		if (type == NAL_SPS || type == NAL_PPS)
+		struct mkv_parameter_set *set = parameter_set(m, nal);
+		if (set != NULL)
 		{
-			error = keep_parameter_set(m, nal, nal_size);
+			error = keep_parameter_set(set, nal, nal_size);
 			if (error != MKV_OK)
 				return error;
 		}
@@ -837,7 +1145,7 @@ void mkv_open(struct mkv *m, const struct mkv_io *io, const struct mkv_track *tr
  * @ms:  its timestamp in ms; never less than the previous picture's
  * @key: nonzero for a key frame; every MJPEG or raw picture is one regardless
  *
- * A picture opens a Cluster if it is the first, an H.264 key frame (so that
+ * A picture opens a Cluster if it is the first, an H.264 or H.265 key frame (so that
  * seeking lands on one), or CLUSTER_MS (MJPEG, raw: CLUSTER_MS_INTRA) after the
  * Cluster's start. A key frame that opens a Cluster gets a cue point once it
  * is complete (mkv_picture_end()). While a picture is open this does nothing,
@@ -849,7 +1157,7 @@ int mkv_picture_begin(struct mkv *m, uint32_t ms, int key)
 {
 	if (picture_open(m) || reserve(m, ELEMENT_HEADERS_MOST) != MKV_OK)
 		return m->error;
-	int intra = m->track.codec != MKV_H264;
+	int intra = !annexb(m);
 	int key_frame = key || intra;
 	uint32_t cluster_span = intra ? CLUSTER_MS_INTRA : CLUSTER_MS;
 	int new_cluster = !m->cluster_open || (key_frame && !intra) || ms - m->cluster_ms >= cluster_span;
@@ -875,7 +1183,7 @@ int mkv_picture_begin(struct mkv *m, uint32_t ms, int key)
 /**
  * mkv_picture_bytes() - Append bytes to the open picture, in as many pieces as they come.
  * @m:    the muxer
- * @data: H.264 Annex-B, or JPEG
+ * @data: H.264 or H.265 Annex-B, JPEG, or a raw picture
  * @size: their count
  *
  * Return: MKV_OK or the error.
@@ -889,11 +1197,11 @@ int mkv_picture_bytes(struct mkv *m, const void *data, uint32_t size)
 }
 
 /**
- * mkv_picture_end() - Complete the open picture: rewrite H.264 to NAL lengths and fill in the SimpleBlock's size.
+ * mkv_picture_end() - Complete the open picture: rewrite H.264 or H.265 to NAL lengths and fill in the SimpleBlock's size.
  * @m: the muxer
  *
  * The first complete picture also sends the file header ahead of it. A
- * picture of SPS and PPS alone leaves no SimpleBlock.
+ * picture of parameter sets alone leaves no SimpleBlock.
  *
  * Return: MKV_OK or the error.
  */
@@ -902,7 +1210,7 @@ int mkv_picture_end(struct mkv *m)
 	if (m->error != MKV_OK)
 		return m->error;
 	uint32_t size = m->tail - m->payload;
-	if (m->track.codec == MKV_H264)
+	if (annexb(m))
 		m->error = annexb_to_lengths(m, &size);
 	if (m->error != MKV_OK)
 		return m->error;

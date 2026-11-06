@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /*
- * mkv.h - Matroska muxer for one video track, H.264, MJPEG or raw. It never
+ * mkv.h - Matroska muxer for one video track, H.264, H.265, MJPEG or raw. It never
  * allocates or calls the OS: the caller supplies the memory and two file
  * callbacks, so the tests run it on the host (tests/test_mkv.py).
  */
@@ -15,17 +15,18 @@
 /* Errors. After one only mkv_close() is left, which still writes the complete pictures unless it is MKV_ERR_WRITE. */
 #define MKV_OK 0
 #define MKV_ERR_WRITE 1  /* mkv_io.write() failed: a full disk */
-#define MKV_ERR_STREAM 2 /* H.264 not in Annex-B, or without SPS or PPS by its first picture */
+#define MKV_ERR_STREAM 2 /* H.264 or H.265 not in Annex-B, or without its parameter sets by its first picture */
 #define MKV_ERR_ROOM 3   /* a picture larger than the buffer */
 
 /* Codecs */
 #define MKV_H264 0  /* Annex-B, SPS and PPS in or before the first picture */
 #define MKV_MJPEG 1 /* one complete JPEG per picture; every picture is a key frame */
 #define MKV_RAW 2   /* one uncompressed picture, in the pixel format mkv_track.fourcc names; every picture is a key frame */
+#define MKV_H265 3  /* Annex-B, VPS, SPS and PPS in or before the first picture */
 
 struct mkv_track
 {
-	int codec;       /* MKV_H264, MKV_MJPEG or MKV_RAW */
+	int codec;       /* MKV_H264, MKV_H265, MKV_MJPEG or MKV_RAW */
 	uint32_t width;  /* pixels */
 	uint32_t height;
 	uint32_t fps;    /* nominal rate: sets DefaultDuration and the last picture's duration */
@@ -88,8 +89,8 @@ struct mkv
 	uint32_t duration_pos; /* the Duration's Void */
 	uint32_t tracks_pos;   /* the Tracks element */
 
-	/* The first SPS and PPS, for the avcC */
-	struct mkv_parameter_set sps, pps;
+	/* The first parameter sets, for the avcC or hvcC; vps is H.265's only */
+	struct mkv_parameter_set vps, sps, pps;
 };
 
 void mkv_open(struct mkv *m, const struct mkv_io *io, const struct mkv_track *track, void *memory, uint32_t size);

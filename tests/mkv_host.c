@@ -3,7 +3,7 @@
  * mkv_host.c - mkv.c on the host, for test_mkv.py: a recording read from a
  * script, written to a file as the Amiga's would be.
  *
- *   mkv_host script out.mkv WIDTH HEIGHT FPS [full=BYTES] [repeat=N] [unfinished] [mjpeg] [raw=FOURCC]
+ *   mkv_host script out.mkv WIDTH HEIGHT FPS [full=BYTES] [repeat=N] [unfinished] [h265] [mjpeg] [raw=FOURCC]
  *
  * The script is the calls the recorder makes, in 32-bit little-endian words:
  * for each picture its time in ms, whether it is a key frame and how many
@@ -13,7 +13,8 @@
  * repeat= the script over again, later rounds' times after the first's
  * unfinished  the script's last picture is never ended, as when a run stops
  *        between a picture's packets
- * mjpeg  the pictures are JPEGs, not H.264
+ * h265   the pictures are H.265, not H.264
+ * mjpeg  the pictures are JPEGs
  * raw=   the pictures are uncompressed, in this pixel format (YUY2, NV12)
  *
  * The seek refuses what PFS3's refuses: a target at or above 2 GiB.
@@ -120,6 +121,8 @@ int main(int argc, char **argv)
 			repeat = strtoul(argv[i] + 7, NULL, 10);
 		else if (strcmp(argv[i], "unfinished") == 0)
 			unfinished = 1;
+		else if (strcmp(argv[i], "h265") == 0)
+			track.codec = MKV_H265;
 		else if (strcmp(argv[i], "mjpeg") == 0)
 			track.codec = MKV_MJPEG;
 		else if (strncmp(argv[i], "raw=", 4) == 0 && strlen(argv[i]) == 8)

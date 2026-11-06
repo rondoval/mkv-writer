@@ -5,7 +5,9 @@ import re
 import shutil
 import struct
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, NamedTuple
 
 import pytest
 
@@ -168,6 +170,36 @@ def nal_units(block):
     return out
 
 
+def codec_private(data):
+    """The CodecPrivate of a file's track, by any muxer's rules: ours or ffmpeg's."""
+    eid, size, body = element(data, 0)
+    eid, _, pos = element(data, body + size)
+    assert eid == SEGMENT
+    while True:
+        eid, size, body = element(data, pos)
+        if eid == TRACKS:
+            entry = one(children(data, body, body + size), TRACK_ENTRY)
+            private = one(children(data, entry[1], entry[1] + entry[2]), CODEC_PRIVATE)
+            return data[private[1]:private[1] + private[2]]
+        pos = body + size
+
+
+def hvcc_parts(record):
+    """An hvcC as its fixed part and its arrays, each (array_completeness, NAL unit type, NAL units)."""
+    fixed, arrays, pos = record[:23], [], 23
+    for _ in range(record[22]):
+        head, count = record[pos], int.from_bytes(record[pos + 1:pos + 3], "big")
+        pos += 3
+        nals = []
+        for _ in range(count):
+            size = int.from_bytes(record[pos:pos + 2], "big")
+            nals.append(record[pos + 2:pos + 2 + size])
+            pos += 2 + size
+        arrays.append((bool(head & 0x80), head & 0x3F, nals))
+    assert pos == len(record), "nothing after the arrays"
+    return fixed, arrays
+
+
 def run(cmd, **kw):
     """A tool's completed process."""
     return subprocess.run([str(c) for c in cmd], capture_output=True, **kw)
@@ -186,33 +218,85 @@ def host(tmp_path_factory):
     return exe
 
 
-@pytest.fixture(scope="module")
-def stream(tmp_path_factory):
-    """Six seconds of H.264 like the encoder's: no B frames, one slice, a key frame a second; (raw file, pictures).
+@dataclass(frozen=True)
+class Codec:
+    """A codec of NAL units as the tests see it."""
+    name: str                      # ffmpeg's format and ffprobe's codec_name
+    options: tuple                 # mkv_host's for it
+    encoder: str                   # ffmpeg's encoder for the clips
+    encoder_options: tuple         # what makes its clips like a camera's: no B frames, one slice, a key frame a second
+    codec_id: bytes
+    nal_type: Callable[[bytes], int]
+    slices: range                  # the types of a picture's slices: one ends the picture
+    keys: range                    # those of a key frame
+    parameter_sets: tuple
 
-    Each picture: its time in ms, whether it is a key frame, its Annex-B with four-byte start codes.
-    """
-    if shutil.which("ffmpeg") is None:
-        pytest.skip("no ffmpeg")
-    raw = tmp_path_factory.mktemp("h264") / "clip.h264"
-    r = run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"testsrc2=s={WIDTH}x{HEIGHT}:r={FPS}:d={SECONDS}", "-c:v", "libx264", "-pix_fmt",
-             "yuv420p", "-profile:v", "high", "-bf", "0", "-g", str(FPS), "-x264-params", "slices=1:scenecut=0", "-f", "h264", raw])
-    if r.returncode != 0:
-        pytest.skip(f"no libx264: {r.stderr.decode()[-200:]}")
-    data = raw.read_bytes()
+
+H264 = Codec("h264", (), "libx264", ("-profile:v", "high", "-bf", "0", "-g", str(FPS), "-x264-params", "slices=1:scenecut=0"),
+             b"V_MPEG4/ISO/AVC", lambda nal: nal[0] & 0x1F, range(1, 6), range(5, 6), (7, 8))
+H265 = Codec("hevc", ("h265",), "libx265",
+             ("-x265-params", f"bframes=0:keyint={FPS}:min-keyint={FPS}:scenecut=0:info=0:log-level=error"),
+             b"V_MPEGH/ISO/HEVC", lambda nal: (nal[0] >> 1) & 0x3F, range(0, 32), range(16, 24), (32, 33, 34))
+
+
+class Stream(NamedTuple):
+    """A clip: the raw file, its pictures as the recorder sends them, and its codec."""
+    raw: Path
+    pictures: list
+    codec: Codec
+
+
+def pictures_of(data, codec):
+    """Annex-B cut into pictures: each its time in ms, whether it is a key frame, its NAL units with four-byte start codes."""
     starts = [m.start() for m in re.finditer(b"\x00\x00\x01", data)]
     pictures, current, key = [], b"", False
     for i, at in enumerate(starts):
         end = starts[i + 1] if i + 1 < len(starts) else len(data)
         nal = data[at + 3:end].rstrip(b"\x00")
         current += b"\x00\x00\x00\x01" + nal
-        kind = nal[0] & 0x1F
-        key = key or kind == 5
-        if kind in (1, 5):
+        kind = codec.nal_type(nal)
+        key = key or kind in codec.keys
+        if kind in codec.slices:
             pictures.append((len(pictures) * 1000 // FPS, key, current))
             current, key = b"", False
-    assert len(pictures) == FPS * SECONDS
-    return raw, pictures
+    return pictures
+
+
+def ffmpeg_encode(codec, out, muxer, seconds, pix_fmt, options):
+    """ffmpeg's encoding of the test pattern into @out; skipped without ffmpeg or the codec's encoder."""
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("no ffmpeg")
+    r = run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"testsrc2=s={WIDTH}x{HEIGHT}:r={FPS}:d={seconds}", "-c:v", codec.encoder, "-pix_fmt",
+             pix_fmt, *(codec.encoder_options if options is None else options), "-f", muxer, out])
+    if r.returncode != 0:
+        pytest.skip(f"no {codec.encoder}: {r.stderr.decode()[-200:]}")
+
+
+def encode(tmp_path_factory, codec, seconds=SECONDS, pix_fmt="yuv420p", options=None):
+    """@seconds of test pattern in @codec: a Stream."""
+    raw = tmp_path_factory.mktemp(codec.name) / f"clip.{codec.name}"
+    ffmpeg_encode(codec, raw, codec.name, seconds, pix_fmt, options)
+    pictures = pictures_of(raw.read_bytes(), codec)
+    assert len(pictures) == FPS * seconds
+    return Stream(raw, pictures, codec)
+
+
+@pytest.fixture(scope="module")
+def h264_stream(tmp_path_factory):
+    """Six seconds of H.264 like the encoder's."""
+    return encode(tmp_path_factory, H264)
+
+
+@pytest.fixture(scope="module")
+def h265_stream(tmp_path_factory):
+    """Six seconds of H.265 like the encoder's."""
+    return encode(tmp_path_factory, H265)
+
+
+@pytest.fixture(params=["h264", "h265"])
+def stream(request):
+    """Each codec's clip in turn, for what holds for both."""
+    return request.getfixturevalue(f"{request.param}_stream")
 
 
 def script(path, pictures, pieces=None):
@@ -260,31 +344,29 @@ def tiny_pictures(count, size=32):
 
 def test_ffmpeg_reads_every_picture_the_same(host, tmp_path, stream):
     """Decoded from the file, each picture hashes as it does from the raw stream, and ffmpeg has nothing to complain of."""
-    raw, pictures = stream
-    out = mux(host, tmp_path, pictures)
-    want, _ = frame_md5("-i", raw)
+    out = mux(host, tmp_path, stream.pictures, *stream.codec.options)
+    want, _ = frame_md5("-i", stream.raw)
     got, errors = frame_md5("-i", out)
     assert errors == "", errors
-    assert got == want and len(got) == len(pictures)
+    assert got == want and len(got) == len(stream.pictures)
 
 
 def test_ffprobe_sees_the_track(host, tmp_path, stream):
-    """H.264, the size, the rate, the duration; every packet's time and key flag as given."""
-    _, pictures = stream
-    out = mux(host, tmp_path, pictures)
+    """The codec, the size, the rate, the duration; every packet's time and key flag as given."""
+    out = mux(host, tmp_path, stream.pictures, *stream.codec.options)
     r = run(["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries", "stream=codec_name,width,height,avg_frame_rate:format=duration",
              "-of", "default=nw=1", out])
     fields = dict(line.split("=") for line in r.stdout.decode().split())
-    assert fields["codec_name"] == "h264" and (int(fields["width"]), int(fields["height"])) == (WIDTH, HEIGHT)
+    assert fields["codec_name"] == stream.codec.name and (int(fields["width"]), int(fields["height"])) == (WIDTH, HEIGHT)
     assert fields["avg_frame_rate"] == "30/1"
     assert abs(float(fields["duration"]) - SECONDS) < 0.05
-    assert probe(out) == [(ms, key) for ms, key, _ in pictures]
+    assert probe(out) == [(ms, key) for ms, key, _ in stream.pictures]
 
 
 def test_structure_by_the_rules(host, tmp_path, stream):
-    """By our own reader: SeekHead and Cues point at what they say, the avcC is right, no parameter sets in the stream."""
-    _, pictures = stream
-    f = File(mux(host, tmp_path, pictures).read_bytes())
+    """By our own reader: SeekHead and Cues point at what they say, the codec is named, no parameter sets in the stream."""
+    pictures, codec = stream.pictures, stream.codec
+    f = File(mux(host, tmp_path, pictures, *codec.options).read_bytes())
     assert b"matroska" in f.doctype
     targets = f.seek_targets()
     for eid in (INFO, TRACKS, CUES):
@@ -298,35 +380,80 @@ def test_structure_by_the_rules(host, tmp_path, stream):
     tracks = f.top_one(TRACKS)
     entry = one(children(f.data, tracks[1], tracks[1] + tracks[2]), TRACK_ENTRY)
     parts = children(f.data, entry[1], entry[1] + entry[2])
-    codec = one(parts, CODEC_ID)
-    assert f.data[codec[1]:codec[1] + codec[2]] == b"V_MPEG4/ISO/AVC"
+    codec_id = one(parts, CODEC_ID)
+    assert f.data[codec_id[1]:codec_id[1] + codec_id[2]] == codec.codec_id
     assert number(f.data, one(parts, DEFAULT_DURATION)) == 1000000000 // FPS
     video = one(parts, VIDEO)
     inner = children(f.data, video[1], video[1] + video[2])
     assert (number(f.data, one(inner, PIXEL_WIDTH)), number(f.data, one(inner, PIXEL_HEIGHT))) == (WIDTH, HEIGHT)
 
-    avcc = f.data[one(parts, CODEC_PRIVATE)[1]:]
-    first = pictures[0][2]
-    sps = next(n for n in first.split(b"\x00\x00\x00\x01") if n and n[0] & 0x1F == 7)
-    pps = next(n for n in first.split(b"\x00\x00\x00\x01") if n and n[0] & 0x1F == 8)
-    assert avcc[:6] == bytes([1, sps[1], sps[2], sps[3], 0xFF, 0xE1])
-    assert avcc[6:8 + len(sps)] == struct.pack(">H", len(sps)) + sps
-    at = 8 + len(sps)
-    assert avcc[at:at + 3 + len(pps)] == b"\x01" + struct.pack(">H", len(pps)) + pps
-    assert avcc[at + 3 + len(pps):at + 7 + len(pps)] == b"\xFD\xF8\xF8\x00"  # High: 4:2:0, 8 bits
-
     blocks = f.blocks()
     assert len(blocks) == len(pictures)
     for block, (ms, key, data) in zip(blocks, pictures):
         assert (block["ms"], block["key"]) == (ms, key)
-        kinds = [n[0] & 0x1F for n in nal_units(block["body"])]
-        assert 7 not in kinds and 8 not in kinds, "parameter sets stay in the avcC"
-        assert kinds[-1] in (1, 5)
+        kinds = [codec.nal_type(n) for n in nal_units(block["body"])]
+        assert not set(kinds) & set(codec.parameter_sets), "parameter sets stay in the CodecPrivate"
+        assert kinds[-1] in codec.slices
+
+
+def first_nal(picture, codec, kind):
+    """The NAL unit of a type in a picture of four-byte start codes."""
+    return next(n for n in picture.split(b"\x00\x00\x00\x01") if n and codec.nal_type(n) == kind)
+
+
+def test_avcc(host, tmp_path, h264_stream):
+    """The avcC holds the first SPS and PPS, and says High's chroma format and bit depths."""
+    f = File(mux(host, tmp_path, h264_stream.pictures).read_bytes())
+    avcc = codec_private(f.data)
+    first = h264_stream.pictures[0][2]
+    sps, pps = first_nal(first, H264, 7), first_nal(first, H264, 8)
+    assert avcc[:6] == bytes([1, sps[1], sps[2], sps[3], 0xFF, 0xE1])
+    assert avcc[6:8 + len(sps)] == struct.pack(">H", len(sps)) + sps
+    at = 8 + len(sps)
+    assert avcc[at:at + 3 + len(pps)] == b"\x01" + struct.pack(">H", len(pps)) + pps
+    assert avcc[at + 3 + len(pps):] == b"\xFD\xF8\xF8\x00"  # High: 4:2:0, 8 bits
+
+
+@pytest.mark.parametrize("pix_fmt,options,chroma,extra_bits,layers", [
+    ("yuv420p", None, 1, 0, 1),
+    ("yuv420p10le", None, 1, 2, 1),
+    ("yuv422p10le", None, 2, 2, 1),
+    ("yuv420p", ("-x265-params", f"bframes=3:keyint={FPS}:min-keyint={FPS}:scenecut=0:info=0:log-level=error:temporal-layers=3"), 1, 0, 3),
+], ids=["main", "main10", "422-10", "sub-layers"])
+def test_hvcc_as_ffmpeg_writes_it(host, tmp_path, tmp_path_factory, pix_fmt, options, chroma, extra_bits, layers):
+    """The hvcC says what ffmpeg's own Matroska of the same encoding says: profile, level, chroma, bit depths, temporal layers
+    and the first VPS, SPS and PPS. Only array_completeness differs: ours is set, since no parameter set stays in the stream.
+    ffmpeg encodes into Matroska itself: it cannot copy a raw stream with B frames, which has no timestamps."""
+    clip = encode(tmp_path_factory, H265, seconds=1, pix_fmt=pix_fmt, options=options)
+    ours = codec_private(mux(host, tmp_path, clip.pictures, *H265.options).read_bytes())
+    theirs = tmp_path / "ffmpeg.mkv"
+    ffmpeg_encode(H265, theirs, "matroska", 1, pix_fmt, options)
+    ours_fixed, ours_arrays = hvcc_parts(ours)
+    theirs_fixed, theirs_arrays = hvcc_parts(codec_private(theirs.read_bytes()))
+    assert (ours_fixed[16] & 3, ours_fixed[17] & 7, ours_fixed[18] & 7) == (chroma, extra_bits, extra_bits)
+    assert (ours_fixed[21] >> 3 & 7, ours_fixed[21] & 3) == (layers, 3), "temporal layers; 4-byte NAL lengths"
+    assert ours_fixed == theirs_fixed
+    assert [(kind, nals) for _, kind, nals in ours_arrays] == [(kind, nals) for _, kind, nals in theirs_arrays]
+    assert [kind for _, kind, _ in ours_arrays] == list(H265.parameter_sets)
+    assert all(complete for complete, _, _ in ours_arrays)
+    if options is None:
+        want, _ = frame_md5("-i", clip.raw)
+        got, errors = frame_md5("-i", tmp_path / "out.mkv")
+        assert errors == "", errors
+        assert got == want
+
+
+def test_an_sps_cut_short(host, tmp_path, h265_stream):
+    """An SPS that ends before the hvcC has all it needs is an error before anything is written."""
+    first = h265_stream.pictures[0]
+    sps = first_nal(first[2], H265, 33)
+    cut = (first[0], first[1], first[2].replace(sps, sps[:10]))
+    assert mux(host, tmp_path, [cut] + h265_stream.pictures[1:], *H265.options, expect=ERR_STREAM).read_bytes() == b""
 
 
 def test_pieces_change_nothing(host, tmp_path, stream):
     """A picture in pieces of any size writes the same file as a picture whole."""
-    _, pictures = stream
+    pictures, options = stream.pictures, stream.codec.options
     rng = random.Random(1)
 
     def pieces(data):
@@ -337,16 +464,15 @@ def test_pieces_change_nothing(host, tmp_path, stream):
             data = data[n:]
         return out
 
-    whole = mux(host, tmp_path, pictures, name="whole.mkv").read_bytes()
-    assert mux(host, tmp_path, pictures, pieces=pieces, name="cut.mkv").read_bytes() == whole
+    whole = mux(host, tmp_path, pictures, *options, name="whole.mkv").read_bytes()
+    assert mux(host, tmp_path, pictures, *options, pieces=pieces, name="cut.mkv").read_bytes() == whole
 
 
 @pytest.mark.parametrize("seconds", [1.0, 2.5, 4.0, 5.5])
 def test_seeking(host, tmp_path, stream, seconds):
     """Seeking lands on the right picture: a decode from there matches the decode from the start."""
-    raw, pictures = stream
-    out = mux(host, tmp_path, pictures)
-    want, _ = frame_md5("-i", raw)
+    out = mux(host, tmp_path, stream.pictures, *stream.codec.options)
+    want, _ = frame_md5("-i", stream.raw)
     got, errors = frame_md5("-ss", str(seconds), "-i", out, "-frames:v", "3")
     assert errors == "", errors
     at = want.index(got[0])
@@ -356,12 +482,11 @@ def test_seeking(host, tmp_path, stream, seconds):
 @pytest.mark.parametrize("cut", [0.25, 0.5, 0.75, 0.9, 0.999])
 def test_a_cut_file_plays_to_the_cut(host, tmp_path, stream, cut):
     """A crash leaves no Cues and no Duration, and a file that plays up to where it stops."""
-    raw, pictures = stream
-    data = mux(host, tmp_path, pictures).read_bytes()
+    data = mux(host, tmp_path, stream.pictures, *stream.codec.options).read_bytes()
     cues_at = File(data).top_one(CUES)[3]
     short = tmp_path / "short.mkv"
     short.write_bytes(data[:int(cues_at * cut)])
-    want, _ = frame_md5("-i", raw)
+    want, _ = frame_md5("-i", stream.raw)
     got, _ = frame_md5("-i", short)
     assert len(got) >= int(len(want) * cut) - FPS, f"{len(got)} of {len(want)} pictures"
     assert got == want[:len(got)], "the pictures it does play are the right ones"
@@ -370,9 +495,8 @@ def test_a_cut_file_plays_to_the_cut(host, tmp_path, stream, cut):
 
 def test_a_long_pause_opens_a_cluster(host, tmp_path, stream):
     """Over a block's 16 bits of time: a new cluster with no key frame and no cue, the times right."""
-    _, pictures = stream
-    late = [(ms if i < 100 else ms + 40000, key, data) for i, (ms, key, data) in enumerate(pictures)]
-    out = mux(host, tmp_path, late)
+    late = [(ms if i < 100 else ms + 40000, key, data) for i, (ms, key, data) in enumerate(stream.pictures)]
+    out = mux(host, tmp_path, late, *stream.codec.options)
     f = File(out.read_bytes())
     assert [b["ms"] for b in f.blocks()] == [ms for ms, _, _ in late]
     opened = [c["time"] for c in f.clusters if not c["blocks"][0]["key"]]
@@ -383,15 +507,15 @@ def test_a_long_pause_opens_a_cluster(host, tmp_path, stream):
 
 def test_a_full_disk(host, tmp_path, stream):
     """Mid-picture: the error reported, no Cues sought, the Duration still in, and it plays to the cut."""
-    raw, pictures = stream
-    total = len(mux(host, tmp_path, pictures).read_bytes())
-    out = mux(host, tmp_path, pictures, f"full={total // 2}", name="full.mkv", expect=ERR_WRITE)
+    pictures, options = stream.pictures, stream.codec.options
+    total = len(mux(host, tmp_path, pictures, *options).read_bytes())
+    out = mux(host, tmp_path, pictures, *options, f"full={total // 2}", name="full.mkv", expect=ERR_WRITE)
     data = out.read_bytes()
     assert len(data) == total // 2
     f = File(data)
     assert f.duration() is not None
     assert not [t for t in f.top if t[0] in (SEEK_HEAD, CUES)]
-    want, _ = frame_md5("-i", raw)
+    want, _ = frame_md5("-i", stream.raw)
     got, _ = frame_md5("-i", out)
     assert len(got) > len(want) // 3 and got == want[:len(got)]
 
@@ -402,15 +526,29 @@ def test_nothing_recorded_writes_nothing(host, tmp_path):
 
 
 def test_parameter_sets_on_their_own(host, tmp_path, stream):
-    """If the firmware ever sends SPS and PPS as a packet of their own: the same file, byte for byte."""
-    _, pictures = stream
+    """If the firmware ever sends the parameter sets as a packet of their own: the same file, byte for byte."""
+    pictures, codec = stream.pictures, stream.codec
     ms, key, first = pictures[0]
-    nals = [b"\x00\x00\x00\x01" + n for n in first.split(b"\x00\x00\x00\x01") if n]
-    sets = b"".join(n for n in nals if n[4] & 0x1F in (7, 8))
-    rest = b"".join(n for n in nals if n[4] & 0x1F not in (7, 8))
-    together = mux(host, tmp_path, pictures, name="together.mkv").read_bytes()
-    apart = mux(host, tmp_path, [(0, True, sets), (ms, key, rest)] + pictures[1:], name="apart.mkv").read_bytes()
+    sets, rest = parameter_sets_apart(first, codec)
+    together = mux(host, tmp_path, pictures, *codec.options, name="together.mkv").read_bytes()
+    apart = mux(host, tmp_path, [(0, True, sets), (ms, key, rest)] + pictures[1:], *codec.options, name="apart.mkv").read_bytes()
     assert apart == together
+
+
+def parameter_sets_apart(picture, codec):
+    """A picture of four-byte start codes as (its parameter sets, the rest)."""
+    nals = [b"\x00\x00\x00\x01" + n for n in picture.split(b"\x00\x00\x00\x01") if n]
+    sets = b"".join(n for n in nals if codec.nal_type(n[4:]) in codec.parameter_sets)
+    return sets, b"".join(n for n in nals if codec.nal_type(n[4:]) not in codec.parameter_sets)
+
+
+def test_parameter_sets_at_every_key_frame(host, tmp_path, stream):
+    """Cameras repeat the parameter sets at each key frame: the first are kept, the file is the same, byte for byte."""
+    pictures, codec = stream.pictures, stream.codec
+    sets, _ = parameter_sets_apart(pictures[0][2], codec)
+    repeated = [(ms, key, (sets if key and i > 0 else b"") + data) for i, (ms, key, data) in enumerate(pictures)]
+    want = mux(host, tmp_path, pictures, *codec.options, name="once.mkv").read_bytes()
+    assert mux(host, tmp_path, repeated, *codec.options, name="repeated.mkv").read_bytes() == want
 
 
 @pytest.mark.parametrize("picture", [
@@ -419,9 +557,9 @@ def test_parameter_sets_on_their_own(host, tmp_path, stream):
     b"\x00\x00\x00\x01",  # a start code and nothing after it
     b"\x00\x00\x01\x65\x88\x00\x00\x00\x01",  # the same at the end
 ], ids=["none", "half", "empty", "empty-last"])
-def test_not_annex_b(host, tmp_path, picture):
+def test_not_annex_b(host, tmp_path, stream, picture):
     """What is not Annex-B is an error, not a broken file."""
-    mux(host, tmp_path, tiny_pictures(1) + [(33, False, picture)], expect=ERR_STREAM)
+    mux(host, tmp_path, stream.pictures[:1] + [(33, False, picture)], *stream.codec.options, expect=ERR_STREAM)
 
 
 def recoded(pictures, start_code):
@@ -441,26 +579,26 @@ def recoded(pictures, start_code):
 ], ids=["three", "three-after-four", "four-after-three", "padded"])
 def test_start_codes_of_any_length(host, tmp_path, stream, start_code):
     """Three-byte start codes, mixed ones and zero padding write the same file as four-byte ones, byte for byte."""
-    _, pictures = stream
-    want = mux(host, tmp_path, pictures, name="four.mkv").read_bytes()
-    assert mux(host, tmp_path, recoded(pictures, start_code), name="other.mkv").read_bytes() == want
+    pictures, options = stream.pictures, stream.codec.options
+    want = mux(host, tmp_path, pictures, *options, name="four.mkv").read_bytes()
+    assert mux(host, tmp_path, recoded(pictures, start_code), *options, name="other.mkv").read_bytes() == want
 
 
 def test_three_byte_start_codes_in_pieces(host, tmp_path, stream):
     """A start code cut in two by the packets changes nothing either."""
-    _, pictures = stream
-    want = mux(host, tmp_path, pictures, name="four.mkv").read_bytes()
+    pictures, options = stream.pictures, stream.codec.options
+    want = mux(host, tmp_path, pictures, *options, name="four.mkv").read_bytes()
     three = recoded(pictures, lambda i: b"\x00\x00\x01")
     pieces = lambda d: [d[i:i + 2] for i in range(0, len(d), 2)] if len(d) < 2000 else [d]
-    assert mux(host, tmp_path, three, pieces=pieces, name="three.mkv").read_bytes() == want
+    assert mux(host, tmp_path, three, *options, pieces=pieces, name="three.mkv").read_bytes() == want
 
 
 def test_padding_after_a_picture(host, tmp_path, stream):
     """Zero bytes after the last NAL unit are not part of it."""
-    _, pictures = stream
-    want = mux(host, tmp_path, pictures, name="clean.mkv").read_bytes()
+    pictures, options = stream.pictures, stream.codec.options
+    want = mux(host, tmp_path, pictures, *options, name="clean.mkv").read_bytes()
     padded = [(ms, key, data + bytes(7)) for ms, key, data in pictures]
-    assert mux(host, tmp_path, padded, name="padded.mkv").read_bytes() == want
+    assert mux(host, tmp_path, padded, *options, name="padded.mkv").read_bytes() == want
 
 
 def many_nals(count, size, code):
@@ -576,8 +714,7 @@ def test_mjpeg_nothing_recorded_writes_nothing(host, tmp_path):
 
 def test_writing_app(host, tmp_path, stream):
     """The header says who wrote it."""
-    _, pictures = stream
-    data = mux(host, tmp_path, pictures[:2]).read_bytes()
+    data = mux(host, tmp_path, stream.pictures[:2], *stream.codec.options).read_bytes()
     assert b"mkv-writer" in data[:512] and b"mkv_host" in data[:512]
 
 

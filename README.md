@@ -5,6 +5,8 @@ Writes one video track into a Matroska (`.mkv`) file. Plain C with no dependenci
 
 - **H.264:** give it Annex-B, with three- or four-byte start codes. SPS and PPS go into the
   track's avcC, and start codes become lengths in place.
+- **H.265:** the same, with VPS, SPS and PPS going into the track's hvcC. Main, Main 10 and the
+  range extensions' chroma formats and bit depths all work.
 - **MJPEG:** give it complete JPEGs.
 - **Raw video:** give it whole uncompressed pictures and name their pixel format as a FourCC,
   such as `YUY2` or `NV12`. It is stored as `V_UNCOMPRESSED`, the way ffmpeg writes and reads
@@ -48,7 +50,7 @@ the file.
 ## Tests
 
 ```sh
-python3 -m pytest          # needs a C compiler and ffmpeg with libx264
+python3 -m pytest          # needs a C compiler and ffmpeg with libx264 and libx265
 python3 -m pytest -m "not slow"   # skips the one that writes 2 GiB
 ```
 
